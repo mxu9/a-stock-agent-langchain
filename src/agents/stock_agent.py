@@ -137,9 +137,14 @@ async def main():
                 version="v2",
             ):
                 if event["event"] == "on_tool_start":
-                    print(f"\n  🔧 调用工具: {event['name']}", flush=True)
+                    tool_input = event.get("data", {}).get("input", "")
+                    print(f"\n  🔧 {event['name']}({tool_input})", flush=True)
                 elif event["event"] == "on_tool_end":
-                    print(f"  ✅ 工具返回", flush=True)
+                    output = event.get("data", {}).get("output", "")
+                    if isinstance(output, str) and "Error" in output:
+                        print(f"  ❌ {output[:150]}", flush=True)
+                    else:
+                        print(f"  ✅ 工具返回", flush=True)
                 elif event["event"] == "on_chat_model_stream":
                     chunk = event["data"]["chunk"]
                     if hasattr(chunk, "content"):
