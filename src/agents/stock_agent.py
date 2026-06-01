@@ -106,6 +106,25 @@ class StockAnalysisAgent:
         """返回 checkpointer，供外部按 thread_id 查询历史"""
         return self._checkpointer
 
+    async def get_thread_history(self, thread_id: str) -> list:
+        """获取指定会话的完整对话历史，返回 messages 列表"""
+        config = {"configurable": {"thread_id": thread_id}}
+        state = await self._agent.aget_state(config)
+        if state and state.values:
+            return state.values.get("messages", [])
+        return []
+
+    def list_threads(self) -> list[str]:
+        """列出所有活跃的会话 thread_id"""
+        # MemorySaver 内部将 checkpoint 存在 _checkpoints dict 中
+        if hasattr(self._checkpointer, "_checkpoints"):
+            return list(self._checkpointer._checkpoints.keys())
+        return []
+
+    def delete_thread(self, thread_id: str):
+        """删除指定会话的所有历史"""
+        self._checkpointer.delete_thread(thread_id)
+
     async def close(self):
         """释放 MCP SSE 连接和所有资源"""
         await self.mcp_adapter.close()
@@ -154,21 +173,20 @@ async def main():
         print("📜 对话历史")
         print("=" * 60)
 
-        state = await agent._agent.aget_state(thread)
-        if state and state.values:
-            messages = state.values.get("messages", [])
-            if messages:
-                for msg in messages:
-                    role_map = {"human": "👤 用户", "ai": "🤖 助手", "tool": "🔧 工具"}
-                    role = role_map.get(msg.type, f"❓ {msg.type}")
-                    content = msg.content
-                    if isinstance(content, str) and len(content) > 150:
-                        content = content[:150] + "..."
-                    print(f"  {role}: {content}")
-            else:
-                print("  (无历史消息)")
+        # ── 历史记录 ──
+        messages = await agent.get_thread_history("integration-test")
+        if messages:
+            for msg in messages:
+                role_map = {"human": "👤 用户", "ai": "🤖 助手", "tool": "🔧 工具"}
+                role = role_map.get(msg.type, f"❓ {msg.type}")
+                content = msg.content
+                if isinstance(content, str) and len(content) > 150:
+                    content = content[:150] + "..."
+                print(f"  {role}: {content}")
         else:
-            print("  (无可用状态)")
+            print("  (无历史消息)")
+
+        print(f"\n📋 活跃会话: {agent.list_threads()}")
     finally:
         # ── 销毁 ──
         print(f"\n{'=' * 60}")
