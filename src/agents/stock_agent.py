@@ -2,7 +2,7 @@
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from src.tools.mcp_adapter import MCPToolAdapter
 from src.prompts.system_prompt import SYSTEM_PROMPT
@@ -19,6 +19,7 @@ class StockAnalysisAgent:
             self.model_config = LLMSettings().to_dict()
         self._agent = None
         self._checkpointer = None
+        self._checkpointer_ctx = None  # AsyncSqliteSaver 异步上下文管理器
     
     async def initialize(self):
         """异步初始化：加载MCP工具并创建Agent"""
@@ -42,8 +43,13 @@ class StockAnalysisAgent:
             streaming=True,  # 开启流式
         )
         
-        # 4. 初始化记忆（LangGraph checkpointer，自动持久化对话状态）
-        self._checkpointer = MemorySaver()
+        # 4. 初始化记忆（SQLite 持久化，重启后保留对话历史）
+        db_path = self.model_config.get("db_path", "data/agent.db")
+        # 确保目录存在
+        import os as _os
+        _os.makedirs(_os.path.dirname(db_path) or ".", exist_ok=True)
+        self._checkpointer_ctx = AsyncSqliteSaver.from_conn_string(db_path)
+        self._checkpointer = await self._checkpointer_ctx.__aenter__()
         
         # 5. 创建Agent
         self._agent = create_agent(
@@ -114,20 +120,27 @@ class StockAnalysisAgent:
             return state.values.get("messages", [])
         return []
 
-    def list_threads(self) -> list[str]:
+    async def list_threads(self) -> list[str]:
         """列出所有活跃的会话 thread_id"""
-        # MemorySaver 内部将 checkpoint 存在 _checkpoints dict 中
-        if hasattr(self._checkpointer, "_checkpoints"):
-            return list(self._checkpointer._checkpoints.keys())
-        return []
+        threads = []
+        async for cp in self._checkpointer.alist(None):
+            if cp.config and "configurable" in cp.config:
+                tid = cp.config["configurable"].get("thread_id")
+                if tid and tid not in threads:
+                    threads.append(tid)
+        return threads
 
-    def delete_thread(self, thread_id: str):
+    async def delete_thread(self, thread_id: str):
         """删除指定会话的所有历史"""
-        self._checkpointer.delete_thread(thread_id)
+        await self._checkpointer.adelete_thread(thread_id)
 
     async def close(self):
         """释放 MCP SSE 连接和所有资源"""
         await self.mcp_adapter.close()
+        # 关闭 SQLite 连接（AsyncSqliteSaver 异步上下文管理器）
+        if self._checkpointer_ctx is not None:
+            await self._checkpointer_ctx.__aexit__(None, None, None)
+            self._checkpointer_ctx = None
 
 
 # ============================================================
@@ -186,7 +199,7 @@ async def main():
         else:
             print("  (无历史消息)")
 
-        print(f"\n📋 活跃会话: {agent.list_threads()}")
+        print(f"\n📋 活跃会话: {await agent.list_threads()}")
     finally:
         # ── 销毁 ──
         print(f"\n{'=' * 60}")
