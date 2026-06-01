@@ -55,33 +55,45 @@ class StockAnalysisAgent:
         
         return self
     
-    async def chat(self, user_input: str):
-        """与Agent对话，流式返回"""
+    async def chat(self, user_input: str, thread_id: str = None):
+        """与Agent对话，流式返回原始 state"""
+        config = None
+        if thread_id:
+            config = {"configurable": {"thread_id": thread_id}}
+
         async for chunk in self._agent.astream(
-            {"messages": [HumanMessage(content=user_input)]}
+            {"messages": [HumanMessage(content=user_input)]},
+            config=config,
         ):
             yield chunk
     
-    async def chat_with_tool_feedback(self, user_input: str):
-        """带工具调用反馈的对话"""
-        # 可以监听工具调用过程
+    async def chat_with_tool_feedback(self, user_input: str, thread_id: str = None):
+        """带工具调用反馈的对话，支持多轮记忆"""
+        config = None
+        if thread_id:
+            config = {"configurable": {"thread_id": thread_id}}
+
         async for event in self._agent.astream_events(
             {"messages": [HumanMessage(content=user_input)]},
-            version="v2"
+            config=config,
+            version="v2",
         ):
             if event["event"] == "on_tool_start":
-                print(f"🔧 正在调用工具: {event['name']}")
+                tool_input = event.get("data", {}).get("input", "")
+                print(f"\n  🔧 {event['name']}({tool_input})", flush=True)
             elif event["event"] == "on_tool_end":
-                print(f"✅ 工具执行完成")
+                output = event.get("data", {}).get("output", "")
+                if isinstance(output, str) and "Error" in output:
+                    print(f"  ❌ {output[:150]}", flush=True)
+                else:
+                    print(f"  ✅ 工具返回", flush=True)
             elif event["event"] == "on_chat_model_stream":
                 chunk = event["data"]["chunk"]
-                # AIMessageChunk → .content 可能是 str 或 list[dict]
                 if hasattr(chunk, "content"):
                     content = chunk.content
                     if isinstance(content, str):
                         yield content
                     elif isinstance(content, list):
-                        # 多模态内容，只提取 text 部分
                         for item in content:
                             if isinstance(item, dict) and item.get("type") == "text":
                                 yield item.get("text", "")
@@ -131,26 +143,10 @@ async def main():
             print(f"💬 Chat {i}: {question}")
             print(f"{'─' * 60}")
 
-            async for event in agent._agent.astream_events(
-                {"messages": [HumanMessage(content=question)]},
-                config=thread,
-                version="v2",
+            async for text in agent.chat_with_tool_feedback(
+                question, thread_id="integration-test"
             ):
-                if event["event"] == "on_tool_start":
-                    tool_input = event.get("data", {}).get("input", "")
-                    print(f"\n  🔧 {event['name']}({tool_input})", flush=True)
-                elif event["event"] == "on_tool_end":
-                    output = event.get("data", {}).get("output", "")
-                    if isinstance(output, str) and "Error" in output:
-                        print(f"  ❌ {output[:150]}", flush=True)
-                    else:
-                        print(f"  ✅ 工具返回", flush=True)
-                elif event["event"] == "on_chat_model_stream":
-                    chunk = event["data"]["chunk"]
-                    if hasattr(chunk, "content"):
-                        content = chunk.content
-                        if isinstance(content, str):
-                            print(content, end="", flush=True)
+                print(text, end="", flush=True)
             print()  # 换行
 
         # ── 历史记录 ──
