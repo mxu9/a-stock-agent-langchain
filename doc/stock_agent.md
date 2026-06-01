@@ -37,7 +37,8 @@
 |------|------|
 | `langchain.agents.create_agent` | LangGraph Agent 工厂，返回 `CompiledStateGraph` |
 | `langchain_openai.ChatOpenAI` | LLM 调用（兼容 OpenAI API 协议的任意模型） |
-| `langgraph.checkpoint.memory.MemorySaver` | 对话状态持久化（checkpointer） |
+| `langgraph.checkpoint.sqlite.aio.AsyncSqliteSaver` | 对话状态持久化（SQLite，跨重启保留） |
+| `aiosqlite` | AsyncSqliteSaver 的异步 SQLite 驱动 |
 | `langchain_core.messages.HumanMessage` | 用户消息封装 |
 | `src.tools.mcp_adapter.MCPToolAdapter` | MCP 工具发现与转换 |
 | `src.prompts.system_prompt.SYSTEM_PROMPT` | Agent 系统提示词 |
@@ -54,7 +55,8 @@
 | `mcp_adapter` | `MCPToolAdapter` | 管理 MCP SSE 连接和工具发现 |
 | `model_config` | `dict` | LLM 配置：`model` / `base_url` / `api_key` / `temperature` |
 | `_agent` | `CompiledStateGraph` | LangGraph 编译后的 Agent 执行图 |
-| `_checkpointer` | `MemorySaver` | 对话状态快照，基于 thread_id 管理多轮记忆 |
+| `_checkpointer` | `AsyncSqliteSaver` | 对话状态持久化（SQLite），基于 thread_id 管理多轮记忆 |
+| `_checkpointer_ctx` | `AsyncContextManager` | checkpointer 的异步上下文管理器，close() 时释放 |
 
 ### 3.2 生命周期
 
@@ -95,6 +97,7 @@
     "base_url":    "https://api.deepseek.com",  # 默认值
     "api_key":     "sk-xxx",                    # 无默认值
     "temperature": 0.7,                         # 默认值
+    "db_path":     "data/agent.db",              # 默认值
 }
 ```
 
@@ -135,7 +138,7 @@ agent = StockAnalysisAgent("config/mcp_config.json", {
 
 ③ 创建 LLM           →  ChatOpenAI(model, base_url, api_key, temperature, streaming=True)
 
-④ 创建 MemorySaver   →  内存版 checkpointer
+④ 创建 AsyncSqliteSaver →  await __aenter__()，SQLite 持久化 checkpointer
 
 ⑤ 编译 Agent Graph   →  create_agent(model, tools, system_prompt, checkpointer)
     └─ 返回 CompiledStateGraph
@@ -203,24 +206,48 @@ chunk = event["data"]["chunk"]
 
 ---
 
-### 4.5 `get_checkpointer() -> MemorySaver`
+### 4.5 `get_checkpointer() -> AsyncSqliteSaver`
 
-**功能**：返回内部 checkpointer，供外部按 thread_id 查询对话历史。
+**功能**：返回内部 checkpointer，供需要直接访问底层 API 的场景。
 
-**用法**：
+---
+
+### 4.6 `async get_thread_history(thread_id: str) -> list`
+
+**功能**：获取指定会话的完整对话历史。
+
+**返回值**：`list[Message]`，空列表表示不存在或已清除。
 
 ```python
-checkpointer = agent.get_checkpointer()
-state = await agent._agent.aget_state(
-    {"configurable": {"thread_id": "session-1"}}
-)
-for msg in state.values["messages"]:
+messages = await agent.get_thread_history("user-123")
+for msg in messages:
     print(f"{msg.type}: {msg.content}")
 ```
 
 ---
 
-### 4.6 `async close()`
+### 4.7 `async list_threads() -> list[str]`
+
+**功能**：列出所有活跃的会话 thread_id。
+
+```python
+threads = await agent.list_threads()
+print(f"活跃会话: {threads}")
+```
+
+---
+
+### 4.8 `async delete_thread(thread_id: str)`
+
+**功能**：删除指定会话的所有历史（不可逆）。
+
+```python
+await agent.delete_thread("user-123")
+```
+
+---
+
+### 4.9 `async close()`
 
 **功能**：释放 MCP SSE 连接和所有资源。
 
@@ -345,9 +372,11 @@ python -m src.agents.stock_agent
 
 如果在 `ChatOpenAI()` 构造时不校验，空 `api_key` 不会立即报错。只有到第一次 `chat()` 调用 LLM 时才会抛 `AuthenticationError`——此时距离初始化可能已经过了很久，排查根因需要回溯到配置阶段。尽早校验缩小了错误半径。
 
-### 8.4 为什么 MemorySaver 而非外部数据库
+### 8.4 为什么 SQLite 持久化
 
-`MemorySaver` 存在进程内存中：
-- **优势**：零依赖、零配置、适合开发和单机部署
-- **局限**：进程重启后丢失、不支持多实例共享
-- **升级路径**：`MemorySaver` → `SqliteSaver`（持久化）→ `PostgresSaver`（生产级），接口完全兼容，仅替换实现即可
+`AsyncSqliteSaver` 将对话状态存在 SQLite 文件中：
+
+- **持久化**：进程重启后对话历史不丢失，数据库文件默认为 `data/agent.db`
+- **生产就绪**：比 `MemorySaver` 更可靠，通过 `.env` 的 `DB_PATH` 指定路径
+- **升级路径**：`AsyncSqliteSaver` → `PostgresSaver`（多实例共享），接口完全兼容
+- **注意**：`AsyncSqliteSaver` 要求所有操作用 async 接口（`alist`、`adelete_thread` 等）

@@ -49,5 +49,10 @@ htmlcov/
 # Jupyter
 .ipynb_checkpoints/
 
+# Database
+*.db
+*.db-shm
+*.db-wal
+
 # Docker
 docker-compose.override.yml
