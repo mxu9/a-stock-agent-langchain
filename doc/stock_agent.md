@@ -149,28 +149,43 @@ agent = StockAnalysisAgent("config/mcp_config.json", {
 
 ---
 
-### 4.3 `async chat(user_input: str) -> AsyncGenerator`
+### 4.3 `async chat(user_input: str, thread_id: str = None) -> AsyncGenerator`
 
-**功能**：发送用户消息，流式返回 Agent 的响应。
+**功能**：发送用户消息，流式返回 Agent 的原始 state 快照。
 
-**输入**：`user_input` — 用户自然语言输入
+**参数**：
 
-**输出**：`AsyncGenerator`，每次 yield LangGraph state 快照（dict）。调用方可以遍历获取，但不做格式转换——原始 state 包含 `messages` 列表。
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `user_input` | `str` | 是 | 用户自然语言输入 |
+| `thread_id` | `str` | 否 | 会话 ID，传入则启用 checkpointer 多轮记忆 |
 
-**注意**：当前 `chat()` 不传 `config` 参数，因此 checkpointer 不会跨轮关联。如需多轮记忆，建议调用方直接使用 `agent._agent.astream(..., config={"configurable": {"thread_id": "..."}})`。
+**输出**：`AsyncGenerator`，每次 yield LangGraph state 快照（dict）。原始 state 包含 `messages` 列表，调用方可自行解析。
+
+**适用场景**：需要完整 state（含 tool message、structured_response 等非文本内容），或自定义输出格式。
 
 ---
 
-### 4.4 `async chat_with_tool_feedback(user_input: str) -> AsyncGenerator`
+### 4.4 `async chat_with_tool_feedback(user_input: str, thread_id: str = None) -> AsyncGenerator`
 
-**功能**：与 `chat()` 相同，但会 yield 工具调用的实时反馈文本。
+**功能**：发送用户消息，流式返回纯文本。同时在终端打印工具调用的完整过程（名称、参数、错误）。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `user_input` | `str` | 是 | 用户自然语言输入 |
+| `thread_id` | `str` | 否 | 会话 ID，传入则启用 checkpointer 多轮记忆 |
+
+**输出**：`AsyncGenerator`，每次 yield 提取后的纯文本字符串。
 
 **事件处理**：
 
 | 事件 | 行为 |
 |------|------|
-| `on_tool_start` | `print("🔧 正在调用工具: {name}")` |
-| `on_tool_end` | `print("✅ 工具执行完成")` |
+| `on_tool_start` | `print("🔧 {name}({input})")` — 显示工具名和参数 |
+| `on_tool_end` → 有 Error | `print("❌ {output[:150]}")` — 显示错误详情 |
+| `on_tool_end` → 成功 | `print("✅ 工具返回")` |
 | `on_chat_model_stream` | yield 提取后的文本 |
 
 **内容提取策略**（三层安全）：
@@ -182,10 +197,9 @@ chunk = event["data"]["chunk"]
                             → isinstance(content, list)   → yield text items only
                             → else                        → yield str(content)
 ② isinstance(chunk, str)                                 → yield chunk
-③ 以上都不匹配                                            → 不 yield（静默跳过）
 ```
 
-这避免了直接 `.content` 在非标准返回类型上抛 `AttributeError`。
+**适用场景**：CLI 工具、终端调试、集成测试——需要看到工具调用全过程。
 
 ---
 
@@ -280,25 +294,20 @@ await agent.close()
 ### 多轮对话（带记忆）
 
 ```python
-thread = {"configurable": {"thread_id": "user-123"}}
+thread_id = "user-123"
 
-# 第一轮
-async for event in agent._agent.astream_events(
-    {"messages": [HumanMessage(content="茅台估值")]},
-    config=thread, version="v2",
-):
-    if event["event"] == "on_chat_model_stream":
-        print(event["data"]["chunk"].content, end="")
+# 第一轮——带工具反馈
+async for text in agent.chat_with_tool_feedback("茅台估值", thread_id=thread_id):
+    print(text, end="")
 
 # 第二轮——Agent 记得上一轮讨论过茅台
-async for event in agent._agent.astream_events(
-    {"messages": [HumanMessage(content="再看看五粮液")]},
-    config=thread, version="v2",
-):
-    ...
+async for text in agent.chat_with_tool_feedback("再看看五粮液", thread_id=thread_id):
+    print(text, end="")
 
 # 查看历史
-state = await agent._agent.aget_state(thread)
+state = await agent._agent.aget_state(
+    {"configurable": {"thread_id": thread_id}}
+)
 ```
 
 ### 集成测试
@@ -321,9 +330,16 @@ python -m src.agents.stock_agent
 - 调用方可以在构造后、`initialize()` 前做额外配置
 - 异步操作在明确的 `await` 点触发，不隐藏在构造函数中
 
-### 8.2 为什么 `chat()` 不传 config
+### 8.2 `chat()` 与 `chat_with_tool_feedback()` 的分工
 
-`chat()` 是简化接口，适合单轮或无需记忆的场景。多轮对话时，调用方直接使用 `agent._agent.astream(..., config=...)` 获得完整控制权。这避免了在 `chat()` 上增加 `thread_id` 参数导致接口臃肿。
+两个方法都支持可选的 `thread_id` 参数，区别在于**输出粒度**：
+
+| 方法 | 底层 API | yield 内容 | 工具调用可见 | 适用场景 |
+|------|----------|-----------|-------------|---------|
+| `chat()` | `astream` | 原始 state dict | ❌ 不可见 | 服务端 API、自定义格式 |
+| `chat_with_tool_feedback()` | `astream_events` | 纯文本字符串 | ✅ 终端打印 | CLI、调试、集成测试 |
+
+`thread_id` 为可选参数——不传时退化为单轮模式（无记忆），传入同一 `thread_id` 则自动启用 checkpointer 多轮记忆。
 
 ### 8.3 为什么 api_key 在初始化阶段校验
 
